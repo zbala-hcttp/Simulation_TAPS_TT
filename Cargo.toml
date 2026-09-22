@@ -25,7 +25,7 @@ name = "benchmark"
 path = "src/bin/benchmark.rs"
 
 [dependencies]
-taps = { path = "../TAPS_TT" }
+taps_tt = { path = "../TAPS_TT" }
 secp256k1 = { version = "0.31.1", features = ["rand", "global-context", "serde"] }
 aes-gcm = "0.10"
 rand = "0.8"
