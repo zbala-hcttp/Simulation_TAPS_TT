@@ -2,8 +2,9 @@ use crate::crypto::{BroadcastPackage, SecurePackage};
 use secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 /// File the Authority publishes its public keys to, and the only piece of key
 /// material any actor trusts a priori.
@@ -84,6 +85,35 @@ pub enum Message {
 
     /// One-to-many, signed but not encrypted. Same reasoning for the keys.
     Broadcast { package: BroadcastPackage },
+}
+
+/// Binds a listener, retrying on `AddrInUse` for a while.
+///
+/// Back-to-back runs (the benchmark suite, or a manual run right after a
+/// previous one) can start a new Authority/Combiner before the OS has
+/// released the previous process' socket from `TIME_WAIT` - on Windows this
+/// can take minutes, far longer than any reasonable inter-scenario
+/// cooldown. Retrying here means that delay is absorbed automatically
+/// instead of failing the whole run.
+pub async fn bind_with_retry(addr: &str) -> Result<TcpListener, Box<dyn Error>> {
+    let attempts = 60;
+    let mut last_err = None;
+    for attempt in 0..attempts {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) => {
+                if attempt == 0 {
+                    println!(
+                        "[Network] Port {} is still in use, retrying (this is normal right after a previous run)...",
+                        addr
+                    );
+                }
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    Err(Box::new(last_err.unwrap()))
 }
 
 /// Helper: Send a message with a 4-byte length header.

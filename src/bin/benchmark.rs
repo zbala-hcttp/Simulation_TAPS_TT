@@ -5,13 +5,18 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
+    // (n signers, n_3 tracers). The signer threshold t = floor(n/2)+1 and
+    // the tracer threshold t_e = floor(2*n_3/3)+1 are derived by the
+    // Authority itself.
     let scenarios = vec![
-        (10, 6),
-        (25, 13),
-        (50, 26),
-        (100, 51),
-        (250, 126),
-        (500, 251),
+        (10, 1),
+        (10, 5),
+        (25, 1),
+        (25, 5),
+        (50, 1),
+        (50, 5),
+        (100, 1),
+        (100, 5),
     ];
 
     let mut file_s = OpenOptions::new()
@@ -35,12 +40,12 @@ fn main() {
         .open("benchmark_results_tracer.csv")
         .expect("Cannot open file");
 
-    writeln!(file_s, "N,T,Signer_ID,Phase,Time_Microseconds").unwrap();
-    writeln!(file_c, "N,T,Phase,Time_Microseconds").unwrap();
-    writeln!(file_t, "N,T,Phase,Time_Microseconds").unwrap();
+    writeln!(file_s, "N,N3,Signer_ID,Phase,Time_Microseconds").unwrap();
+    writeln!(file_c, "N,N3,Phase,Time_Microseconds").unwrap();
+    writeln!(file_t, "N,N3,Tracer_ID,Phase,Time_Microseconds").unwrap();
 
     println!("==================================================");
-    println!("   STARTING TAPS BENCHMARK SUITE");
+    println!("   STARTING TAPS_TT BENCHMARK SUITE");
     println!("==================================================");
 
     let status = Command::new("cargo")
@@ -51,8 +56,8 @@ fn main() {
 
     let mut failures = 0usize;
 
-    for (n, t) in scenarios {
-        if !run_scenario(n, t, &mut file_s, &mut file_c, &mut file_t) {
+    for (n, n3) in scenarios {
+        if !run_scenario(n, n3, &mut file_s, &mut file_c, &mut file_t) {
             failures += 1;
         }
 
@@ -75,15 +80,15 @@ fn main() {
     }
 }
 
-/// Runs one (n, t) scenario. Returns false if any actor failed.
+/// Runs one (n_1, n_3) scenario. Returns false if any actor failed.
 fn run_scenario(
     n: usize,
-    t: usize,
+    n3: usize,
     file_s: &mut std::fs::File,
     file_c: &mut std::fs::File,
     file_t: &mut std::fs::File,
 ) -> bool {
-    println!("\n>>> Running Scenario: N={} T={} <<<", n, t);
+    println!("\n>>> Running Scenario: N={} N3={} <<<", n, n3);
 
     let release_path = "target/release";
     let ext = if cfg!(target_os = "windows") { ".exe" } else { "" };
@@ -92,7 +97,7 @@ fn run_scenario(
 
     let mut authority = Command::new(format!("{}/authority{}", release_path, ext))
         .arg(n.to_string())
-        .arg(t.to_string())
+        .arg(n3.to_string())
         .stdout(Stdio::null()) // We don't need Authority logs
         .spawn()
         .expect("Failed to start Authority");
@@ -105,10 +110,16 @@ fn run_scenario(
 
     thread::sleep(Duration::from_secs(2));
 
-    let tracer = Command::new(format!("{}/tracer{}", release_path, ext))
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("Failed to start Tracer");
+    let mut tracer_handles: Vec<Child> = Vec::new();
+    for k in 0..n3 {
+        let t = Command::new(format!("{}/tracer{}", release_path, ext))
+            .arg(k.to_string())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Failed to start tracer");
+        tracer_handles.push(t);
+        thread::sleep(Duration::from_millis(50));
+    }
 
     let mut signer_handles: Vec<Child> = Vec::new();
     for i in 0..n {
@@ -124,10 +135,10 @@ fn run_scenario(
     let output_c = combiner.wait_with_output().expect("Combiner failed");
     if !output_c.status.success() {
         eprintln!(
-            "   [Combiner] EXITED WITH FAILURE ({:?}) for N={} T={}",
+            "   [Combiner] EXITED WITH FAILURE ({:?}) for N={} N3={}",
             output_c.status.code(),
             n,
-            t
+            n3
         );
         ok = false;
     }
@@ -139,8 +150,7 @@ fn run_scenario(
             if parts.len() >= 3 {
                 let phase = parts[1];
                 let time = parts[2];
-                writeln!(file_c, "{},{},{},{}", n, t, phase, time).unwrap();
-                //println!("   [Combiner] {}: {} us", phase, time);
+                writeln!(file_c, "{},{},{},{}", n, n3, phase, time).unwrap();
             }
         }
     }
@@ -160,31 +170,32 @@ fn run_scenario(
             if line.starts_with("BENCH") {
                 let parts: Vec<&str> = line.split(',').collect();
                 if parts.len() >= 3 {
-                    writeln!(file_s, "{},{},{},{},{}", n, t, i, parts[1], parts[2]).unwrap();
-                    //println!("   [Signer] {}: {} us", parts[1], parts[2]);
+                    writeln!(file_s, "{},{},{},{},{}", n, n3, i, parts[1], parts[2]).unwrap();
                 }
             }
         }
     }
 
-    let output_t = tracer.wait_with_output().expect("Tracer failed");
-    if !output_t.status.success() {
-        eprintln!(
-            "   [Tracer] EXITED WITH FAILURE ({:?}) - verification did not pass",
-            output_t.status.code()
-        );
-        ok = false;
-    }
+    for (k, t) in tracer_handles.into_iter().enumerate() {
+        let output_t = t.wait_with_output().expect("Tracer failed");
+        if !output_t.status.success() {
+            eprintln!(
+                "   [Tracer #{}] EXITED WITH FAILURE ({:?}) - verification did not pass",
+                k,
+                output_t.status.code()
+            );
+            ok = false;
+        }
 
-    let stdout_str_t = String::from_utf8_lossy(&output_t.stdout);
-    for line in stdout_str_t.lines() {
-        if line.starts_with("BENCH") {
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() >= 3 {
-                let phase = parts[1];
-                let time = parts[2];
-                writeln!(file_t, "{},{},{},{}", n, t, phase, time).unwrap();
-                //println!("   [Tracer] {}: {} us", phase, time);
+        let stdout_str_t = String::from_utf8_lossy(&output_t.stdout);
+        for line in stdout_str_t.lines() {
+            if line.starts_with("BENCH") {
+                let parts: Vec<&str> = line.split(',').collect();
+                if parts.len() >= 3 {
+                    let phase = parts[1];
+                    let time = parts[2];
+                    writeln!(file_t, "{},{},{},{},{}", n, n3, k, phase, time).unwrap();
+                }
             }
         }
     }

@@ -5,7 +5,7 @@ use simulation_taps_tt::{
 };
 use std::error::Error;
 use std::time::Instant;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 const AUTHORITY_ADDR: &str = "127.0.0.1:8080";
 const COMBINER_PORT: &str = "127.0.0.1:8081";
@@ -14,13 +14,12 @@ const MESSAGE_BYTES: &[u8] = b"Hello TAPS: Distributed Privacy-Preserving Blockc
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    println!("[Combiner] Starting TAPS Combiner Node...");
+    println!("[Combiner] Starting TAPS_TT Combiner Node...");
 
     // =========================================================================
     // Phase 1: Bootstrap from Authority
     // =========================================================================
 
-    // 1. Generate Ephemeral Transport Keys. Timed: real setup work.
     let start_keygen = Instant::now();
     let mut combiner = Combiner::new();
     let keygen_us = start_keygen.elapsed().as_micros();
@@ -28,7 +27,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let transport_pk_bytes = combiner.transport_kp.pk.serialize().to_vec();
     let identity_pk_bytes = combiner.identity_kp.pk.serialize().to_vec();
 
-    // 2. Connect to Authority
     println!(
         "[Combiner] Connecting to Authority at {}...",
         AUTHORITY_ADDR
@@ -37,7 +35,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let anchor = network::load_authority_anchor()?;
 
-    // 3. Send Hello
     let hello = Message::Hello {
         id: 0,
         role: Role::Combiner,
@@ -46,8 +43,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     network::send(&mut auth_stream, &hello).await?;
 
-    // The wait for all other actors to register is not protocol cost, so the
-    // benchmark timer starts only once the package is in hand.
     let msg = network::receive(&mut auth_stream).await?;
     match msg {
         Message::Secure { package } => {
@@ -63,34 +58,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let n_signers = combiner.n.unwrap();
+    let n3 = combiner.n3.unwrap();
 
-    println!("[Combiner] Bootstrap Complete. Quorum Size: {}", n_signers);
+    println!(
+        "[Combiner] Bootstrap Complete. Quorum Size: {}, Tracers: {}",
+        n_signers, n3
+    );
 
     // =========================================================================
     // Phase 2: Network Setup (Server)
     // =========================================================================
 
-    let listener = TcpListener::bind(COMBINER_PORT).await?;
+    let listener = network::bind_with_retry(COMBINER_PORT).await?;
     println!("[Combiner] Listening on {}...", COMBINER_PORT);
 
-    let expected_connections = n_signers + 1;
+    let expected_connections = n_signers + n3;
 
     let mut signer_streams: Vec<Option<TcpStream>> = (0..n_signers).map(|_| None).collect();
-
-    let mut tracer_stream: Option<TcpStream> = None;
+    let mut tracer_streams: Vec<Option<TcpStream>> = (0..n3).map(|_| None).collect();
     let mut connected_count = 0;
 
     println!(
-        "[Combiner] Waiting for {} participants...",
-        expected_connections
+        "[Combiner] Waiting for {} participants ({} signers, {} tracers)...",
+        expected_connections, n_signers, n3
     );
 
     while connected_count < expected_connections {
         let (mut socket, addr) = listener.accept().await?;
         println!("[Combiner] Incoming connection from {}", addr);
 
-        // Handshake. This only claims an id; the Authority-issued keys are what
-        // authenticate the packages that follow.
         let msg = network::receive(&mut socket).await?;
         if let Message::Hello { id, role, .. } = msg {
             match role {
@@ -104,10 +100,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 Role::Tracer => {
-                    if tracer_stream.is_none() {
-                        println!("[Combiner] Tracer connected.");
-                        tracer_stream = Some(socket);
+                    if id < n3 && tracer_streams[id].is_none() {
+                        println!("[Combiner] Tracer #{} connected.", id);
+                        tracer_streams[id] = Some(socket);
                         connected_count += 1;
+                    } else {
+                        println!("[Combiner] Rejected tracer claim for id {}.", id);
                     }
                 }
                 _ => {}
@@ -117,12 +115,72 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("[Combiner] All participants connected. Starting Protocol.\n");
 
     // =========================================================================
-    // Phase 3: Protocol Execution
+    // Phase 3: Tracer distributed key generation relay
+    // =========================================================================
+
+    let start_dkg_relay = Instant::now();
+
+    println!("[Combiner] >> DKG Round 1: Collecting tracer broadcasts...");
+    for (id, stream_opt) in tracer_streams.iter_mut().enumerate() {
+        if let Some(stream) = stream_opt {
+            let msg = network::receive(stream).await?;
+            if let Message::Secure { package } = msg {
+                combiner.load_dkg_round1(id, &package)?;
+            }
+        }
+    }
+
+    let round1_bundle = combiner.prepare_dkg_round1_bundle();
+    for stream_opt in tracer_streams.iter_mut() {
+        if let Some(stream) = stream_opt {
+            network::send(
+                stream,
+                &Message::Broadcast {
+                    package: round1_bundle.clone(),
+                },
+            )
+            .await?;
+        }
+    }
+
+    println!("[Combiner] >> DKG Round 2: Relaying tracer shares...");
+    for (id, stream_opt) in tracer_streams.iter_mut().enumerate() {
+        if let Some(stream) = stream_opt {
+            let msg = network::receive(stream).await?;
+            if let Message::Secure { package } = msg {
+                combiner.load_dkg_shares(id, &package)?;
+            }
+        }
+    }
+
+    for (id, stream_opt) in tracer_streams.iter_mut().enumerate() {
+        if let Some(stream) = stream_opt {
+            let inbox = combiner.dkg_inbox_for(id);
+            let sealed = combiner.seal_for_tracer(id, &inbox)?;
+            network::send(stream, &Message::Secure { package: sealed }).await?;
+        }
+    }
+
+    println!("[Combiner] >> DKG Finalization: Collecting tracer public keys...");
+    for (id, stream_opt) in tracer_streams.iter_mut().enumerate() {
+        if let Some(stream) = stream_opt {
+            let msg = network::receive(stream).await?;
+            if let Message::Secure { package } = msg {
+                combiner.load_dkg_report(id, &package)?;
+            }
+        }
+    }
+
+    combiner.finalize_group_key()?;
+    let duration_dkg_relay = start_dkg_relay.elapsed();
+    println!("BENCH,TracerDkgRelay,{}", duration_dkg_relay.as_micros());
+    println!("[Combiner] Tracer group key pk_e established (n_3={}).", n3);
+
+    // =========================================================================
+    // Phase 4: Signing protocol
     // =========================================================================
 
     println!("[Combiner] >> Round 1: Collecting Commitments...");
-    // Accumulate only the per-message verify/decrypt/deserialize cost; time spent
-    // blocked on the socket is scheduling, not protocol work.
     let mut commit_processing_us: u128 = 0;
     for (id, stream_opt) in signer_streams.iter_mut().enumerate() {
         if let Some(stream) = stream_opt {
@@ -212,8 +270,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         duration_encrypted_signature.as_micros()
     );
 
-    // Encrypted bits (and gamma) must exist before alpha is drawn, and alpha
-    // before phi_i, which depends on it.
     let start_compute_encrypted_bits = Instant::now();
     combiner.compute_encrypted_bits()?;
     let duration_compute_encrypted_bits = start_compute_encrypted_bits.elapsed();
@@ -242,7 +298,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let duration_compute_proofs = start_compute_proofs.elapsed();
     println!("BENCH,Proofs,{}", duration_compute_proofs.as_micros());
 
-    // beta is only well defined once the commitments S1..S4c above exist.
     let start_compute_beta = Instant::now();
     combiner.compute_beta()?;
     let duration_compute_beta = start_compute_beta.elapsed();
@@ -266,16 +321,49 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     println!("[Combiner] >> Final Sigma Constructed!");
 
-    if let Some(stream) = tracer_stream.as_mut() {
-        println!("[Combiner] Sending Result to Tracer...");
-        let tracer_pkg = combiner.prepare_tracer_package(&sigma, MESSAGE_BYTES);
-        network::send(
-            stream,
-            &Message::Broadcast {
-                package: tracer_pkg,
-            },
-        )
-        .await?;
+    // =========================================================================
+    // Phase 5: Attestation broadcast to every tracer
+    // =========================================================================
+
+    println!("[Combiner] Sending Result to {} Tracer(s)...", n3);
+    let tracer_pkg = combiner.prepare_tracer_package(&sigma, MESSAGE_BYTES);
+    for stream_opt in tracer_streams.iter_mut() {
+        if let Some(stream) = stream_opt {
+            network::send(
+                stream,
+                &Message::Broadcast {
+                    package: tracer_pkg.clone(),
+                },
+            )
+            .await?;
+        }
+    }
+
+    // =========================================================================
+    // Phase 6: Relay tracers' partial decryptions to each other
+    // =========================================================================
+
+    println!("[Combiner] >> Collecting partial decryptions from tracers...");
+    for (id, stream_opt) in tracer_streams.iter_mut().enumerate() {
+        if let Some(stream) = stream_opt {
+            let msg = network::receive(stream).await?;
+            if let Message::Secure { package } = msg {
+                combiner.load_partial_decryption(id, &package)?;
+            }
+        }
+    }
+
+    let partial_bundle = combiner.prepare_partial_decryption_bundle();
+    for stream_opt in tracer_streams.iter_mut() {
+        if let Some(stream) = stream_opt {
+            network::send(
+                stream,
+                &Message::Broadcast {
+                    package: partial_bundle.clone(),
+                },
+            )
+            .await?;
+        }
     }
 
     println!("\n[Combiner] Protocol Finished Successfully.");

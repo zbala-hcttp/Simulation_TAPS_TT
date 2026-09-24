@@ -5,45 +5,47 @@ use secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
 use taps_tt::protocol::taps_tt::*;
 
+/// Signer threshold `t = floor(n/2) + 1`.
+pub fn signer_threshold(n: usize) -> usize {
+    n / 2 + 1
+}
+
+/// Tracer reconstruction threshold `t_e = floor(2*n_3/3) + 1`.
+pub fn tracer_threshold(n3: usize) -> usize {
+    (2 * n3) / 3 + 1
+}
+
+/// Keys the Authority generates directly: signers and the combiner. The
+/// tracer group key `pk_e` is no longer generated here - the `n_3` tracers
+/// produce it themselves via distributed key generation (Figure
+/// `dist-keygen`), and the Authority never learns any tracer secret.
 pub struct KeyPairs {
     pub signers_keys: Vec<KeyPair>,
     pub combiner_keys: KeyPair,
-    pub tracer_keys: KeyPair,
-    pub tracing_keys: Vec<KeyPair>,
 }
 
 impl KeyPairs {
     pub fn new(n: usize) -> Self {
         let mut signers = Vec::with_capacity(n);
-        let mut tracing = Vec::with_capacity(n);
 
         for _ in 0..n {
             signers.push(KeyPair::create());
-            tracing.push(KeyPair::create());
         }
 
         let combiner_kp = KeyPair::create();
 
-        let tracer_kp = KeyPair::create();
-
         KeyPairs {
             signers_keys: signers,
             combiner_keys: combiner_kp,
-            tracing_keys: tracing,
-            tracer_keys: tracer_kp,
         }
     }
 
-    pub fn set_pk(&self) -> PK {
-        PK::set(&self.signers_keys, &self.combiner_keys, &self.tracer_keys)
+    pub fn signer_public_keys(&self) -> Vec<PublicKey> {
+        self.signers_keys.iter().map(|kp| kp.public_key()).collect()
     }
 
     pub fn set_quorum(&self, t: usize) -> Quorum {
         Quorum::choose(self.signers_keys.len(), t, &self.signers_keys)
-    }
-
-    pub fn set_tracing_keys(&self) -> TracingKeys {
-        TracingKeys::set(&self.tracing_keys)
     }
 }
 
@@ -76,14 +78,19 @@ impl SignerPackage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CombinerPackage {
     pub kp_cs: KeyPair,
-    pub pk: PK,
+    pub pk_i: Vec<PublicKey>,
     pub n: usize,
     pub(crate) t: usize,
+    /// Number of tracers and the reconstruction threshold they will use.
+    pub n3: usize,
+    pub te: usize,
     pub quo: Quorum,
-    pub tks: TracingKeys,
     /// Network keys of every signer, indexed by signer id. This is what lets the
     /// Combiner tell a real share from signer #i apart from an impersonated one.
     pub signer_keys: Vec<ActorKeys>,
+    /// Network keys of every tracer, indexed by tracer id (0-based; the DKG
+    /// party index is `id + 1`).
+    pub tracer_keys: Vec<ActorKeys>,
 }
 
 impl CombinerPackage {
@@ -92,40 +99,62 @@ impl CombinerPackage {
         quo: Quorum,
         n: usize,
         t: usize,
+        n3: usize,
+        te: usize,
         signer_keys: Vec<ActorKeys>,
+        tracer_keys: Vec<ActorKeys>,
     ) -> Self {
         CombinerPackage {
             kp_cs: auth_keys.combiner_keys.clone(),
-            pk: auth_keys.set_pk(),
-            n: n,
-            t: t,
+            pk_i: auth_keys.signer_public_keys(),
+            n,
+            t,
+            n3,
+            te,
             quo,
-            tks: TracingKeys::set(&auth_keys.tracing_keys),
             signer_keys,
+            tracer_keys,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TracerPackage {
-    pub kp_t: KeyPair,
-    pub pk: PK,
-    pub tracing_keys: Vec<KeyPair>,
+    /// 0-based tracer id; the DKG party index is `index + 1`.
+    pub index: usize,
+    pub n3: usize,
+    pub te: usize,
+    pub pk_i: Vec<PublicKey>,
+    pub pk_cs: PublicKey,
     /// Public system threshold. The tracer needs it to check that the quorum it
     /// recovers is actually large enough.
     pub t: usize,
     /// Authenticated network keys of the Combiner.
     pub combiner_keys: ActorKeys,
+    /// Authenticated network keys of every tracer (including itself), indexed
+    /// by tracer id, so tracers can verify each other's relayed DKG shares.
+    pub peer_tracers: Vec<ActorKeys>,
 }
 
 impl TracerPackage {
-    pub fn new(auth_keys: &KeyPairs, t: usize, combiner_keys: ActorKeys) -> Self {
+    pub fn new(
+        auth_keys: &KeyPairs,
+        index: usize,
+        n3: usize,
+        te: usize,
+        t: usize,
+        combiner_keys: ActorKeys,
+        peer_tracers: Vec<ActorKeys>,
+    ) -> Self {
         TracerPackage {
-            kp_t: auth_keys.tracer_keys.clone(),
-            pk: auth_keys.set_pk(),
-            tracing_keys: auth_keys.tracing_keys.clone(),
+            index,
+            n3,
+            te,
+            pk_i: auth_keys.signer_public_keys(),
+            pk_cs: auth_keys.combiner_keys.public_key(),
             t,
             combiner_keys,
+            peer_tracers,
         }
     }
 }
@@ -190,22 +219,37 @@ impl Authority {
         quorum: Quorum,
         n: usize,
         t: usize,
+        n3: usize,
+        te: usize,
         signer_keys: Vec<ActorKeys>,
+        tracer_keys: Vec<ActorKeys>,
         receiver_pk: &PublicKey,
     ) -> SecurePackage {
-        // Pass the chosen quorum into the package
-        let pkg = CombinerPackage::new(&self.keys, quorum, n, t, signer_keys);
+        let pkg = CombinerPackage::new(
+            &self.keys,
+            quorum,
+            n,
+            t,
+            n3,
+            te,
+            signer_keys,
+            tracer_keys,
+        );
         self.secure_package(&pkg, receiver_pk)
     }
 
     // --- 3. Prepare Tracer Package ---
     pub fn prepare_tracer_package(
         &self,
+        index: usize,
+        n3: usize,
+        te: usize,
         t: usize,
         combiner_keys: ActorKeys,
+        peer_tracers: Vec<ActorKeys>,
         receiver_pk: &PublicKey,
     ) -> SecurePackage {
-        let pkg = TracerPackage::new(&self.keys, t, combiner_keys);
+        let pkg = TracerPackage::new(&self.keys, index, n3, te, t, combiner_keys, peer_tracers);
         self.secure_package(&pkg, receiver_pk)
     }
 }
@@ -219,13 +263,16 @@ mod tests {
         let n = 5;
         let auth = KeyPairs::new(n);
 
-        // Check key counts
         assert_eq!(auth.signers_keys.len(), n);
-        assert_eq!(auth.tracing_keys.len(), n);
+    }
 
-        // Check structural integrity (keys are valid)
-        // (Just checking if they exist is enough, KeyPair::create guarantees validity)
-        assert_eq!(auth.signers_keys.len(), n);
-        assert_eq!(auth.tracing_keys.len(), n);
+    #[test]
+    fn test_threshold_formulas() {
+        assert_eq!(signer_threshold(100), 51);
+        assert_eq!(signer_threshold(1), 1);
+        assert_eq!(tracer_threshold(1), 1);
+        assert_eq!(tracer_threshold(5), 4);
+        assert_eq!(tracer_threshold(3), 3);
+        assert_eq!(tracer_threshold(4), 3);
     }
 }

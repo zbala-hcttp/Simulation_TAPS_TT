@@ -1,11 +1,11 @@
 use secp256k1::PublicKey;
 use simulation_taps_tt::{
-    authority::{ActorKeys, Authority},
+    authority::{signer_threshold, tracer_threshold, ActorKeys, Authority},
     network::{self, Message, Role},
 };
 use std::env;
 use std::error::Error;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 const PORT: &str = "127.0.0.1:8080";
 
@@ -17,26 +17,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(&"6".to_string())
         .parse::<usize>()
         .map_err(|e| format!("Invalid N: {}", e))?;
-    let t = args
+    let n3 = args
         .get(2)
-        .unwrap_or(&"4".to_string())
+        .unwrap_or(&"1".to_string())
         .parse::<usize>()
-        .map_err(|e| format!("Invalid T: {}", e))?;
+        .map_err(|e| format!("Invalid N3: {}", e))?;
 
     // Reject impossible parameters here, with a clear message, rather than
-    // letting an assert fire deep inside Quorum::choose.
+    // letting an assert fire deep inside Quorum::choose or the tracer DKG.
     if n == 0 {
         return Err("N must be at least 1".into());
     }
-    if t == 0 || t > n {
-        return Err(format!("T must satisfy 1 <= T <= N (got T={}, N={})", t, n).into());
+    if n3 == 0 {
+        return Err("N3 (tracer count) must be at least 1".into());
     }
 
-    println!("[Authority] Starting with N={} T={}...", n, t);
-    println!("[Authority] Starting TAPS Setup Server on {}...", PORT);
+    // Thresholds are fixed by the protocol's formulas, not chosen freely:
+    // signer threshold t = floor(n/2) + 1, tracer threshold
+    // t_e = floor(2*n_3/3) + 1.
+    let t = signer_threshold(n);
+    let te = tracer_threshold(n3);
+
+    println!(
+        "[Authority] Starting with N={} T={} N3={} Te={}...",
+        n, t, n3, te
+    );
+    println!("[Authority] Starting TAPS_TT Setup Server on {}...", PORT);
 
     let auth = Authority::new(n);
-    println!("[Authority] Generated Master Keys.");
+    println!("[Authority] Generated Signer and Combiner Keys.");
+    println!("[Authority] Tracer keys are NOT generated here - the {} tracers will run a distributed key generation among themselves.", n3);
 
     // Publish the trust anchor BEFORE listening, so anyone who manages to
     // connect is guaranteed to be able to read it.
@@ -46,18 +56,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         network::AUTHORITY_ANCHOR_FILE
     );
 
-    let listener = TcpListener::bind(PORT).await?;
+    let listener = network::bind_with_retry(PORT).await?;
 
     let mut signers: Vec<Option<(TcpStream, ActorKeys)>> = (0..n).map(|_| None).collect();
     let mut combiner: Option<(TcpStream, ActorKeys)> = None;
-    let mut tracer: Option<(TcpStream, ActorKeys)> = None;
+    let mut tracers: Vec<Option<(TcpStream, ActorKeys)>> = (0..n3).map(|_| None).collect();
 
-    let expected_connections = n + 2;
+    let expected_connections = n + 1 + n3;
     let mut connected_count = 0;
 
     println!(
-        "[Authority] Waiting for {} actors to connect...",
-        expected_connections
+        "[Authority] Waiting for {} actors to connect ({} signers, 1 combiner, {} tracers)...",
+        expected_connections, n, n3
     );
 
     // 3. Connection Loop (Handshake)
@@ -65,7 +75,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let (mut socket, addr) = listener.accept().await?;
         println!("[Authority] Connection from {}", addr);
 
-        // Receive "Hello" Handshake
         let msg = network::receive(&mut socket).await?;
 
         match msg {
@@ -102,11 +111,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     Role::Tracer => {
-                        if tracer.is_some() {
-                            println!("[Authority] A Tracer is already registered!");
+                        if id >= n3 {
+                            println!("[Authority] Tracer ID {} is out of bounds!", id);
+                        } else if tracers[id].is_some() {
+                            println!("[Authority] Tracer ID {} already registered!", id);
                         } else {
-                            println!("[Authority] Tracer Handshake Verified.");
-                            tracer = Some((socket, keys));
+                            println!("[Authority] Tracer #{} Handshake Verified.", id);
+                            tracers[id] = Some((socket, keys));
                             connected_count += 1;
                         }
                     }
@@ -130,6 +141,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map(|opt| opt.as_ref().map(|(_, keys)| *keys).ok_or("Missing signer"))
         .collect::<Result<_, _>>()?;
 
+    let tracer_keys: Vec<ActorKeys> = tracers
+        .iter()
+        .map(|opt| opt.as_ref().map(|(_, keys)| *keys).ok_or("Missing tracer"))
+        .collect::<Result<_, _>>()?;
+
     for (i, opt) in signers.iter_mut().enumerate() {
         if let Some((stream, keys)) = opt {
             let pkg = auth.prepare_signer_package(i, combiner_keys, &keys.transport_pk);
@@ -145,17 +161,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
             quorum,
             n,
             t,
+            n3,
+            te,
             signer_keys.clone(),
+            tracer_keys.clone(),
             &keys.transport_pk,
         );
         network::send(stream, &Message::Secure { package: pkg }).await?;
         println!("[Authority] Sent SecurePackage to Combiner");
     }
 
-    if let Some((stream, keys)) = tracer.as_mut() {
-        let pkg = auth.prepare_tracer_package(t, combiner_keys, &keys.transport_pk);
-        network::send(stream, &Message::Secure { package: pkg }).await?;
-        println!("[Authority] Sent SecurePackage to Tracer");
+    for (i, opt) in tracers.iter_mut().enumerate() {
+        if let Some((stream, keys)) = opt {
+            let pkg = auth.prepare_tracer_package(
+                i,
+                n3,
+                te,
+                t,
+                combiner_keys,
+                tracer_keys.clone(),
+                &keys.transport_pk,
+            );
+            network::send(stream, &Message::Secure { package: pkg }).await?;
+            println!("[Authority] Sent SecurePackage to Tracer #{}", i);
+        }
     }
 
     println!("[Authority] Setup Complete. Shutting down.");
