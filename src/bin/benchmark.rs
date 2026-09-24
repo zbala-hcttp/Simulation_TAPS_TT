@@ -1,48 +1,106 @@
-use std::fs::OpenOptions;
+use simulation_taps_tt::bench_config::{self, Scenario};
+use simulation_taps_tt::bench_stats::{Actor, BenchRecord, Summarizer, collect_records};
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+/// Raw per-run timings, one row per `BENCH` line.
+const RAW_SIGNERS: &str = "benchmark_results_signers.csv";
+const RAW_COMBINER: &str = "benchmark_results_combiner.csv";
+const RAW_TRACER: &str = "benchmark_results_tracer.csv";
+
+/// Per-operation statistics over every actor of a role and every
+/// successful run of each scenario.
+const SUMMARY: &str = "benchmark_results_summary.csv";
+
+fn create_csv(path: &str, header: &str) -> File {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("Cannot open {}: {}", path, e));
+    writeln!(file, "{}", header).unwrap();
+    file
+}
+
+/// Appends one run's records to the raw CSV files.
+fn write_raw(
+    n: usize,
+    n3: usize,
+    run: usize,
+    records: &[BenchRecord],
+    file_s: &mut File,
+    file_c: &mut File,
+    file_t: &mut File,
+) {
+    for r in records {
+        match r.actor {
+            Actor::Combiner => {
+                writeln!(file_c, "{},{},{},{},{}", n, n3, run, r.phase, r.micros).unwrap()
+            }
+            Actor::Signer(i) => {
+                writeln!(file_s, "{},{},{},{},{},{}", n, n3, run, i, r.phase, r.micros).unwrap()
+            }
+            Actor::Tracer(k) => {
+                writeln!(file_t, "{},{},{},{},{},{}", n, n3, run, k, r.phase, r.micros).unwrap()
+            }
+        }
+    }
+    file_s.flush().unwrap();
+    file_c.flush().unwrap();
+    file_t.flush().unwrap();
+}
+
+/// (Re)writes the summary CSV from everything collected so far.
+fn write_summary(summarizer: &Summarizer) {
+    let mut file = create_csv(
+        SUMMARY,
+        concat!(
+            "N,N3,Runs,Role,Operation,Samples,",
+            "Mean_Microseconds,Std_Dev_Microseconds,Min_Microseconds,Max_Microseconds"
+        ),
+    );
+    for row in summarizer.summaries() {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{:.2},{:.2},{},{}",
+            row.n,
+            row.n3,
+            row.runs,
+            row.role.name(),
+            row.operation,
+            row.samples,
+            row.mean,
+            row.std_dev,
+            row.min,
+            row.max
+        )
+        .unwrap();
+    }
+}
+
 fn main() {
-    // (n signers, n_3 tracers). The signer threshold t = floor(n/2)+1 and
-    // the tracer threshold t_e = floor(2*n_3/3)+1 are derived by the
-    // Authority itself.
-    let scenarios = vec![
-        (10, 1),
-        (10, 5),
-        (25, 1),
-        (25, 5),
-        (50, 1),
-        (50, 5),
-        (100, 1),
-        (100, 5),
-    ];
+    // `benchmark [<n> <n3> [<repeats>]]`. The signer threshold
+    // t = floor(n/2)+1 and the tracer threshold t_e = floor(2*n_3/3)+1 are
+    // derived by the Authority itself.
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    let scenarios: Vec<Scenario> = match bench_config::parse_args(&cli_args) {
+        Ok(scenarios) => scenarios,
+        Err(e) => {
+            eprintln!("{}\n\n{}", e, bench_config::USAGE);
+            std::process::exit(2);
+        }
+    };
 
-    let mut file_s = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open("benchmark_results_signers.csv")
-        .expect("Cannot open file");
+    let mut file_s = create_csv(RAW_SIGNERS, "N,N3,Run,Signer_ID,Phase,Time_Microseconds");
+    let mut file_c = create_csv(RAW_COMBINER, "N,N3,Run,Phase,Time_Microseconds");
+    let mut file_t = create_csv(RAW_TRACER, "N,N3,Run,Tracer_ID,Phase,Time_Microseconds");
 
-    let mut file_c = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open("benchmark_results_combiner.csv")
-        .expect("Cannot open file");
-
-    let mut file_t = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open("benchmark_results_tracer.csv")
-        .expect("Cannot open file");
-
-    writeln!(file_s, "N,N3,Signer_ID,Phase,Time_Microseconds").unwrap();
-    writeln!(file_c, "N,N3,Phase,Time_Microseconds").unwrap();
-    writeln!(file_t, "N,N3,Tracer_ID,Phase,Time_Microseconds").unwrap();
+    let mut summarizer = Summarizer::new();
+    write_summary(&summarizer);
 
     println!("==================================================");
     println!("   STARTING TAPS_TT BENCHMARK SUITE");
@@ -55,24 +113,68 @@ fn main() {
     assert!(status.success(), "cargo build --release --bins failed");
 
     let mut failures = 0usize;
+    let total_runs: usize = scenarios.iter().map(|s| s.repeats).sum();
+    let mut completed_runs = 0usize;
 
-    for (n, n3) in scenarios {
-        if !run_scenario(n, n3, &mut file_s, &mut file_c, &mut file_t) {
-            failures += 1;
+    for scenario in &scenarios {
+        let mut scenario_failures = 0usize;
+        for run in 1..=scenario.repeats {
+            completed_runs += 1;
+            let (ok, records) = run_scenario(scenario.n, scenario.n3, run, scenario.repeats);
+
+            // Every run is kept in the raw files, failed ones included, so a
+            // failure can be investigated. Only successful runs enter the
+            // summary: a run that died partway would skew or leave gaps in it.
+            write_raw(
+                scenario.n,
+                scenario.n3,
+                run,
+                &records,
+                &mut file_s,
+                &mut file_c,
+                &mut file_t,
+            );
+            if ok {
+                summarizer.add_run(scenario.n, scenario.n3, &records);
+                // Rewritten after every run, so an interrupted series still
+                // leaves the statistics of the runs completed so far.
+                write_summary(&summarizer);
+            } else {
+                scenario_failures += 1;
+            }
+
+            // Cool-down period to let OS reclaim ports (TIME_WAIT state)
+            if completed_runs < total_runs {
+                thread::sleep(Duration::from_secs(5));
+            }
         }
 
-        // Cool-down period to let OS reclaim ports (TIME_WAIT state)
-        thread::sleep(Duration::from_secs(5));
+        println!(
+            "\n>>> Scenario N={} N3={}: {}/{} run(s) succeeded <<<",
+            scenario.n,
+            scenario.n3,
+            scenario.repeats - scenario_failures,
+            scenario.repeats
+        );
+        failures += scenario_failures;
     }
 
     println!("\n==================================================");
     if failures == 0 {
-        println!("   ALL SCENARIOS COMPLETED SUCCESSFULLY");
+        println!("   ALL {} RUN(S) COMPLETED SUCCESSFULLY", total_runs);
     } else {
         // A scenario that dies partway through still produces a partially filled
         // CSV, so silence here would look just like success. Say it plainly.
-        println!("   {} SCENARIO(S) FAILED - results are incomplete", failures);
+        println!(
+            "   {} RUN(S) FAILED - excluded from the summary, raw results are incomplete",
+            failures
+        );
     }
+    println!(
+        "   Raw timings:  {}, {}, {}",
+        RAW_SIGNERS, RAW_COMBINER, RAW_TRACER
+    );
+    println!("   Summary:      {}", SUMMARY);
     println!("==================================================");
 
     if failures > 0 {
@@ -80,20 +182,19 @@ fn main() {
     }
 }
 
-/// Runs one (n_1, n_3) scenario. Returns false if any actor failed.
-fn run_scenario(
-    n: usize,
-    n3: usize,
-    file_s: &mut std::fs::File,
-    file_c: &mut std::fs::File,
-    file_t: &mut std::fs::File,
-) -> bool {
-    println!("\n>>> Running Scenario: N={} N3={} <<<", n, n3);
+/// Runs one (n_1, n_3) scenario once, as run number `run` of `repeats`.
+/// Returns whether every actor succeeded, and every `BENCH` record printed.
+fn run_scenario(n: usize, n3: usize, run: usize, repeats: usize) -> (bool, Vec<BenchRecord>) {
+    println!(
+        "\n>>> Running Scenario: N={} N3={} (run {}/{}) <<<",
+        n, n3, run, repeats
+    );
 
     let release_path = "target/release";
     let ext = if cfg!(target_os = "windows") { ".exe" } else { "" };
 
     let mut ok = true;
+    let mut records: Vec<BenchRecord> = Vec::new();
 
     let mut authority = Command::new(format!("{}/authority{}", release_path, ext))
         .arg(n.to_string())
@@ -135,25 +236,18 @@ fn run_scenario(
     let output_c = combiner.wait_with_output().expect("Combiner failed");
     if !output_c.status.success() {
         eprintln!(
-            "   [Combiner] EXITED WITH FAILURE ({:?}) for N={} N3={}",
+            "   [Combiner] EXITED WITH FAILURE ({:?}) for N={} N3={} run {}",
             output_c.status.code(),
             n,
-            n3
+            n3,
+            run
         );
         ok = false;
     }
-
-    let stdout_str_c = String::from_utf8_lossy(&output_c.stdout);
-    for line in stdout_str_c.lines() {
-        if line.starts_with("BENCH") {
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() >= 3 {
-                let phase = parts[1];
-                let time = parts[2];
-                writeln!(file_c, "{},{},{},{}", n, n3, phase, time).unwrap();
-            }
-        }
-    }
+    records.extend(collect_records(
+        Actor::Combiner,
+        &String::from_utf8_lossy(&output_c.stdout),
+    ));
 
     for (i, s) in signer_handles.into_iter().enumerate() {
         let output_s = s.wait_with_output().expect("Failed to wait on signer");
@@ -165,15 +259,10 @@ fn run_scenario(
             );
             ok = false;
         }
-        let stdout_str_s = String::from_utf8_lossy(&output_s.stdout);
-        for line in stdout_str_s.lines() {
-            if line.starts_with("BENCH") {
-                let parts: Vec<&str> = line.split(',').collect();
-                if parts.len() >= 3 {
-                    writeln!(file_s, "{},{},{},{},{}", n, n3, i, parts[1], parts[2]).unwrap();
-                }
-            }
-        }
+        records.extend(collect_records(
+            Actor::Signer(i),
+            &String::from_utf8_lossy(&output_s.stdout),
+        ));
     }
 
     for (k, t) in tracer_handles.into_iter().enumerate() {
@@ -186,18 +275,10 @@ fn run_scenario(
             );
             ok = false;
         }
-
-        let stdout_str_t = String::from_utf8_lossy(&output_t.stdout);
-        for line in stdout_str_t.lines() {
-            if line.starts_with("BENCH") {
-                let parts: Vec<&str> = line.split(',').collect();
-                if parts.len() >= 3 {
-                    let phase = parts[1];
-                    let time = parts[2];
-                    writeln!(file_t, "{},{},{},{},{}", n, n3, k, phase, time).unwrap();
-                }
-            }
-        }
+        records.extend(collect_records(
+            Actor::Tracer(k),
+            &String::from_utf8_lossy(&output_t.stdout),
+        ));
     }
 
     // The Authority exits on its own once setup is done; kill it only if it is
@@ -214,5 +295,5 @@ fn run_scenario(
         _ => {}
     }
 
-    ok
+    (ok, records)
 }

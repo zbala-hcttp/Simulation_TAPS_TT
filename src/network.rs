@@ -3,8 +3,8 @@ use secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 /// File the Authority publishes its public keys to, and the only piece of key
 /// material any actor trusts a priori.
@@ -68,9 +68,10 @@ pub enum Role {
 }
 
 /// The protocol messages exchanged over TCP.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
-    /// Sent by Actor -> Authority to join the network.
+    /// Sent by Actor -> Authority / Combiner to join the network, and by a
+    /// tracer to another tracer when it opens a peer-to-peer link.
     Hello {
         id: usize, // 0..n for Signers, 0 for others
         role: Role,
@@ -117,7 +118,10 @@ pub async fn bind_with_retry(addr: &str) -> Result<TcpListener, Box<dyn Error>> 
 }
 
 /// Helper: Send a message with a 4-byte length header.
-pub async fn send(stream: &mut TcpStream, msg: &Message) -> Result<(), Box<dyn Error>> {
+///
+/// Generic over the writer so it also works on one half of a split stream,
+/// which the tracer mesh needs to send and receive on a link concurrently.
+pub async fn send<W: AsyncWrite + Unpin>(stream: &mut W, msg: &Message) -> Result<(), Box<dyn Error>> {
     let bytes = bincode::serialize(msg)?;
     let len = bytes.len() as u32;
 
@@ -128,7 +132,7 @@ pub async fn send(stream: &mut TcpStream, msg: &Message) -> Result<(), Box<dyn E
 }
 
 /// Helper: Receive a length-prefixed message.
-pub async fn receive(stream: &mut TcpStream) -> Result<Message, Box<dyn Error>> {
+pub async fn receive<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Message, Box<dyn Error>> {
     // 1. Read Length (4 bytes)
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;

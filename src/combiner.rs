@@ -3,7 +3,6 @@ use bincode;
 use secp256k1::{Error, PublicKey, Scalar};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use taps_tt::protocol::dkg::{DkgBroadcast, PartialDecryption};
 use taps_tt::protocol::group::Gt;
 use taps_tt::protocol::taps_tt::*;
 
@@ -57,58 +56,15 @@ pub struct TracerPackage {
     pub m: Vec<u8>,
 }
 
-// --- DKG relay payloads --------------------------------------------------
-
-/// Round 1 (`DistributedKeyGen` steps 1-6): a tracer's own broadcast, sent to
-/// the Combiner to be re-broadcast to every other tracer.
+/// The only message a tracer sends the Combiner: its own `pk_k`, once the
+/// tracers have finished their distributed key generation among themselves.
+///
+/// The Combiner is agnostic of how the tracers generated their keys - it
+/// never sees their broadcasts, Shamir shares or partial decryptions. It only
+/// computes the group key `pk_e = prod_k pk_k`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DkgRound1Package {
-    pub broadcast: DkgBroadcast,
-}
-
-/// The bundle of every tracer's round-1 broadcast, sent back by the Combiner.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DkgRound1Bundle {
-    /// `(tracer id, broadcast)`, 0-based tracer ids.
-    pub broadcasts: Vec<(usize, DkgBroadcast)>,
-}
-
-/// Round 2 (step 8): the shares one tracer computed for every other tracer,
-/// each individually encrypted and signed tracer-to-tracer. The Combiner
-/// only routes these - it cannot decrypt them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DkgSharesPackage {
-    /// `(recipient tracer id, package addressed to that recipient)`.
-    pub shares: Vec<(usize, SecurePackage)>,
-}
-
-/// The inbox the Combiner reassembles for one recipient tracer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DkgShareInbox {
-    /// `(sender tracer id, package from that sender)`.
-    pub items: Vec<(usize, SecurePackage)>,
-}
-
-/// Step 10: a tracer reports its own `pk_k` once the DKG is complete, so the
-/// Combiner can compute `pk_e = prod_{k in QUAL} pk_k`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DkgReportPackage {
-    pub index: usize,
+pub struct TracerPublicKeyPackage {
     pub pk: Gt,
-}
-
-/// A tracer's partial decryption, submitted to the Combiner to be relayed to
-/// every other tracer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartialDecryptionPackage {
-    pub partial: PartialDecryption,
-}
-
-/// The bundle of every tracer's partial decryption, relayed back by the
-/// Combiner so each tracer can locally recombine any `t_e` of them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartialDecryptionBundle {
-    pub partials: Vec<PartialDecryption>,
 }
 
 pub struct Combiner {
@@ -130,10 +86,9 @@ pub struct Combiner {
     pub te: Option<usize>,
     pub taps_kp: Option<KeyPair>,
 
-    // --- Tracer distributed key generation relay ---
-    dkg_round1: BTreeMap<usize, DkgBroadcast>,
-    dkg_inboxes: HashMap<usize, Vec<(usize, SecurePackage)>>,
-    dkg_reports: BTreeMap<usize, Gt>,
+    // --- Tracer group key ---
+    /// `pk_k` reported by each tracer, keyed by tracer id.
+    tracer_pks: BTreeMap<usize, Gt>,
     pub pk_e: Option<PublicKey>,
     pub pk: Option<PK>,
 
@@ -166,9 +121,6 @@ pub struct Combiner {
     pub blinds: Option<Blinds>,
     pub hats: Option<Hats>,
     pub proofs: Option<Proofs>,
-
-    // --- Tracer partial-decryption relay ---
-    partials: BTreeMap<usize, PartialDecryption>,
 }
 
 impl Combiner {
@@ -187,9 +139,7 @@ impl Combiner {
             n3: None,
             te: None,
             taps_kp: None,
-            dkg_round1: BTreeMap::new(),
-            dkg_inboxes: HashMap::new(),
-            dkg_reports: BTreeMap::new(),
+            tracer_pks: BTreeMap::new(),
             pk_e: None,
             pk: None,
             commitments: HashMap::new(),
@@ -211,7 +161,6 @@ impl Combiner {
             blinds: None,
             hats: None,
             proofs: None,
-            partials: BTreeMap::new(),
         }
     }
 
@@ -351,7 +300,7 @@ impl Combiner {
         Ok(())
     }
 
-    // === Tracer distributed key generation relay ==========================
+    // === Tracer group key =================================================
 
     /// Decrypts and authenticates a `SecurePackage` sent by tracer `id`.
     fn open_tracer_package<T: for<'de> Deserialize<'de>>(
@@ -377,77 +326,30 @@ impl Combiner {
         bincode::deserialize(&plaintext_bytes).map_err(|_| Error::InvalidMessage)
     }
 
-    /// Encrypts and signs a payload for tracer `id`, using the Combiner's own
-    /// identity (used for the round-1 bundle and the attestation broadcast).
-    pub fn seal_for_tracer<T: Serialize>(&self, id: usize, payload: &T) -> Result<SecurePackage, Error> {
-        let keys = self.keys_of_tracer(id)?;
-        let plain_bytes = bincode::serialize(payload).expect("Failed to serialize package");
-        let (ciphertext, nonce) = self.transport_kp.encrypt_to(&keys.transport_pk, &plain_bytes);
-        let timestamp = current_timestamp();
-        let signature = self.identity_kp.sign_data(&ciphertext, &nonce, timestamp);
-        Ok(SecurePackage {
-            ciphertext,
-            nonce,
-            timestamp,
-            signature,
-        })
-    }
-
-    pub fn load_dkg_round1(&mut self, tracer_id: usize, secure_pkg: &SecurePackage) -> Result<(), Error> {
-        let pkg: DkgRound1Package = self.open_tracer_package(tracer_id, secure_pkg)?;
-        self.dkg_round1.insert(tracer_id, pkg.broadcast);
-        println!("[Combiner] Received DKG round-1 broadcast from Tracer #{}", tracer_id);
+    /// Records tracer `tracer_id`'s public key `pk_k`.
+    pub fn load_tracer_public_key(
+        &mut self,
+        tracer_id: usize,
+        secure_pkg: &SecurePackage,
+    ) -> Result<(), Error> {
+        let pkg: TracerPublicKeyPackage = self.open_tracer_package(tracer_id, secure_pkg)?;
+        self.tracer_pks.insert(tracer_id, pkg.pk);
+        println!("[Combiner] Received pk_k from Tracer #{}", tracer_id);
         Ok(())
     }
 
-    pub fn dkg_round1_complete(&self) -> bool {
-        self.dkg_round1.len() == self.n3.unwrap_or(usize::MAX)
-    }
-
-    pub fn dkg_round1_bundle(&self) -> DkgRound1Bundle {
-        DkgRound1Bundle {
-            broadcasts: self.dkg_round1.iter().map(|(id, b)| (*id, b.clone())).collect(),
-        }
-    }
-
-    /// Relays tracer `from`'s point-to-point shares into the per-recipient
-    /// inboxes, without inspecting their (encrypted) contents.
-    pub fn load_dkg_shares(&mut self, from: usize, secure_pkg: &SecurePackage) -> Result<(), Error> {
-        let pkg: DkgSharesPackage = self.open_tracer_package(from, secure_pkg)?;
-        for (to, package) in pkg.shares {
-            self.dkg_inboxes.entry(to).or_default().push((from, package));
-        }
-        println!("[Combiner] Relayed DKG shares from Tracer #{}", from);
-        Ok(())
-    }
-
-    pub fn dkg_inboxes_complete(&self) -> bool {
-        let n3 = self.n3.unwrap_or(usize::MAX);
-        (0..n3).all(|id| self.dkg_inboxes.get(&id).map(|v| v.len()).unwrap_or(0) == n3)
-    }
-
-    pub fn dkg_inbox_for(&self, id: usize) -> DkgShareInbox {
-        DkgShareInbox {
-            items: self.dkg_inboxes.get(&id).cloned().unwrap_or_default(),
-        }
-    }
-
-    pub fn load_dkg_report(&mut self, tracer_id: usize, secure_pkg: &SecurePackage) -> Result<(), Error> {
-        let pkg: DkgReportPackage = self.open_tracer_package(tracer_id, secure_pkg)?;
-        self.dkg_reports.insert(tracer_id, pkg.pk);
-        println!("[Combiner] Received DKG report from Tracer #{}", tracer_id);
-        Ok(())
-    }
-
-    pub fn dkg_reports_complete(&self) -> bool {
-        self.dkg_reports.len() == self.n3.unwrap_or(usize::MAX)
+    pub fn tracer_public_keys_complete(&self) -> bool {
+        self.tracer_pks.len() == self.n3.unwrap_or(usize::MAX)
     }
 
     /// Step 2 of `S.KeyGen`: `pk_e = prod_{k in QUAL} pk_k`. Builds the full
     /// public registry `PK` now that the tracer group key is known.
     pub fn finalize_group_key(&mut self) -> Result<(), Error> {
         let mut pk_e_point = Gt::identity();
-        for pk_k in self.dkg_reports.values() {
+        if self.tracer_pks.is_empty() {
+            return Err(Error::InvalidMessage);
+        }
+        for pk_k in self.tracer_pks.values() {
             pk_e_point = pk_e_point.add(pk_k);
         }
         let pk_e = pk_e_point.to_public_key().ok_or(Error::InvalidPublicKey)?;
@@ -832,34 +734,6 @@ impl Combiner {
             m: m.to_vec(),
         };
 
-        self.sign_package(&payload)
-    }
-
-    pub fn prepare_dkg_round1_bundle(&self) -> BroadcastPackage {
-        self.sign_package(&self.dkg_round1_bundle())
-    }
-
-    // === Tracer partial-decryption relay ==================================
-
-    pub fn load_partial_decryption(
-        &mut self,
-        tracer_id: usize,
-        secure_pkg: &SecurePackage,
-    ) -> Result<(), Error> {
-        let pkg: PartialDecryptionPackage = self.open_tracer_package(tracer_id, secure_pkg)?;
-        self.partials.insert(tracer_id, pkg.partial);
-        println!("[Combiner] Received partial decryption from Tracer #{}", tracer_id);
-        Ok(())
-    }
-
-    pub fn partial_decryptions_complete(&self) -> bool {
-        self.partials.len() == self.n3.unwrap_or(usize::MAX)
-    }
-
-    pub fn prepare_partial_decryption_bundle(&self) -> BroadcastPackage {
-        let payload = PartialDecryptionBundle {
-            partials: self.partials.values().cloned().collect(),
-        };
         self.sign_package(&payload)
     }
 }

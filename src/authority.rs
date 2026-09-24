@@ -132,7 +132,7 @@ pub struct TracerPackage {
     /// Authenticated network keys of the Combiner.
     pub combiner_keys: ActorKeys,
     /// Authenticated network keys of every tracer (including itself), indexed
-    /// by tracer id, so tracers can verify each other's relayed DKG shares.
+    /// by tracer id, so tracers can authenticate each other on their direct peer links.
     pub peer_tracers: Vec<ActorKeys>,
 }
 

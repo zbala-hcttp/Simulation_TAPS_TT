@@ -115,65 +115,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("[Combiner] All participants connected. Starting Protocol.\n");
 
     // =========================================================================
-    // Phase 3: Tracer distributed key generation relay
+    // Phase 3: Tracer group key pk_e
     // =========================================================================
+    //
+    // The tracers run their distributed key generation among themselves, over
+    // their own peer-to-peer links. The Combiner is not part of it: it only
+    // receives each tracer's pk_k and computes pk_e = prod_k pk_k.
 
-    let start_dkg_relay = Instant::now();
-
-    println!("[Combiner] >> DKG Round 1: Collecting tracer broadcasts...");
+    println!("[Combiner] >> Waiting for tracer public keys pk_k...");
+    let mut group_key_us: u128 = 0;
     for (id, stream_opt) in tracer_streams.iter_mut().enumerate() {
         if let Some(stream) = stream_opt {
             let msg = network::receive(stream).await?;
-            if let Message::Secure { package } = msg {
-                combiner.load_dkg_round1(id, &package)?;
+            match msg {
+                Message::Secure { package } => {
+                    let start = Instant::now();
+                    combiner.load_tracer_public_key(id, &package)?;
+                    group_key_us += start.elapsed().as_micros();
+                }
+                _ => return Err(format!("Expected pk_k from Tracer #{}", id).into()),
             }
         }
     }
-
-    let round1_bundle = combiner.prepare_dkg_round1_bundle();
-    for stream_opt in tracer_streams.iter_mut() {
-        if let Some(stream) = stream_opt {
-            network::send(
-                stream,
-                &Message::Broadcast {
-                    package: round1_bundle.clone(),
-                },
-            )
-            .await?;
-        }
+    if !combiner.tracer_public_keys_complete() {
+        return Err("Did not receive pk_k from every tracer".into());
     }
 
-    println!("[Combiner] >> DKG Round 2: Relaying tracer shares...");
-    for (id, stream_opt) in tracer_streams.iter_mut().enumerate() {
-        if let Some(stream) = stream_opt {
-            let msg = network::receive(stream).await?;
-            if let Message::Secure { package } = msg {
-                combiner.load_dkg_shares(id, &package)?;
-            }
-        }
-    }
-
-    for (id, stream_opt) in tracer_streams.iter_mut().enumerate() {
-        if let Some(stream) = stream_opt {
-            let inbox = combiner.dkg_inbox_for(id);
-            let sealed = combiner.seal_for_tracer(id, &inbox)?;
-            network::send(stream, &Message::Secure { package: sealed }).await?;
-        }
-    }
-
-    println!("[Combiner] >> DKG Finalization: Collecting tracer public keys...");
-    for (id, stream_opt) in tracer_streams.iter_mut().enumerate() {
-        if let Some(stream) = stream_opt {
-            let msg = network::receive(stream).await?;
-            if let Message::Secure { package } = msg {
-                combiner.load_dkg_report(id, &package)?;
-            }
-        }
-    }
-
+    let start_group_key = Instant::now();
     combiner.finalize_group_key()?;
-    let duration_dkg_relay = start_dkg_relay.elapsed();
-    println!("BENCH,TracerDkgRelay,{}", duration_dkg_relay.as_micros());
+    group_key_us += start_group_key.elapsed().as_micros();
+    println!("BENCH,GroupKey,{}", group_key_us);
     println!("[Combiner] Tracer group key pk_e established (n_3={}).", n3);
 
     // =========================================================================
@@ -333,33 +304,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 stream,
                 &Message::Broadcast {
                     package: tracer_pkg.clone(),
-                },
-            )
-            .await?;
-        }
-    }
-
-    // =========================================================================
-    // Phase 6: Relay tracers' partial decryptions to each other
-    // =========================================================================
-
-    println!("[Combiner] >> Collecting partial decryptions from tracers...");
-    for (id, stream_opt) in tracer_streams.iter_mut().enumerate() {
-        if let Some(stream) = stream_opt {
-            let msg = network::receive(stream).await?;
-            if let Message::Secure { package } = msg {
-                combiner.load_partial_decryption(id, &package)?;
-            }
-        }
-    }
-
-    let partial_bundle = combiner.prepare_partial_decryption_bundle();
-    for stream_opt in tracer_streams.iter_mut() {
-        if let Some(stream) = stream_opt {
-            network::send(
-                stream,
-                &Message::Broadcast {
-                    package: partial_bundle.clone(),
                 },
             )
             .await?;

@@ -15,9 +15,26 @@ use bincode;
 
 /// A single Shamir share `s_{kw} = f_k(w)`, encrypted tracer-to-tracer
 /// (Figure `dist-keygen`, step 8: "send `s_{kw}` to party `w` secretly").
+///
+/// All tracer-to-tracer payloads travel over the direct tracer mesh
+/// (`tracer_mesh`); the Combiner never sees them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DkgSharePayload {
     pub share: Fq,
+}
+
+/// A tracer's round-1 broadcast `(pk_k, A_k, R_k, mu_k)` (Figure
+/// `dist-keygen`, step 6), signed and sent directly to every other tracer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DkgRound1Payload {
+    pub broadcast: DkgBroadcast,
+}
+
+/// A tracer's partial decryption with its Chaum-Pedersen proofs (Figure
+/// `elgamal-decryption`, step 7), encrypted to one other tracer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartialDecryptionPayload {
+    pub partial: PartialDecryption,
 }
 
 pub struct Tracer {
@@ -139,7 +156,8 @@ impl Tracer {
         self.index.expect("Tracer not bootstrapped") + 1
     }
 
-    /// Encrypts and signs a payload addressed to the Combiner.
+    /// Encrypts and signs a payload addressed to the Combiner. The only thing
+    /// a tracer ever sends the Combiner is its `pk_k`.
     pub fn secure_package_for_combiner<T: Serialize>(
         &self,
         payload: &T,
@@ -157,26 +175,133 @@ impl Tracer {
         })
     }
 
+    // === Peer-to-peer sealing ===============================================
+    //
+    // Everything a tracer exchanges with another tracer goes directly over the
+    // tracer mesh, signed with its identity key and - for anything secret -
+    // encrypted to the recipient's transport key. The Combiner is not involved.
+
+    fn peer_keys(&self, id: usize) -> Result<ActorKeys, Error> {
+        self.peer_tracers
+            .as_ref()
+            .ok_or(Error::InvalidMessage)?
+            .get(id)
+            .copied()
+            .ok_or(Error::InvalidMessage)
+    }
+
+    /// Encrypts and signs `payload` for tracer `recipient_id` only
+    /// (`Enc(pk_{lt_w}, .)` in Figure `elgamal-decryption`, step 7).
+    pub fn seal_for_peer<T: Serialize>(
+        &self,
+        recipient_id: usize,
+        payload: &T,
+    ) -> Result<SecurePackage, Error> {
+        let keys = self.peer_keys(recipient_id)?;
+        let plain = bincode::serialize(payload).map_err(|_| Error::InvalidMessage)?;
+        let (ciphertext, nonce) = self.transport_kp.encrypt_to(&keys.transport_pk, &plain);
+        let timestamp = current_timestamp();
+        let signature = self.identity_kp.sign_data(&ciphertext, &nonce, timestamp);
+        Ok(SecurePackage {
+            ciphertext,
+            nonce,
+            timestamp,
+            signature,
+        })
+    }
+
+    /// Authenticates and decrypts a package sent by tracer `sender_id`.
+    pub fn open_from_peer<T: for<'de> Deserialize<'de>>(
+        &self,
+        sender_id: usize,
+        secure_pkg: &SecurePackage,
+    ) -> Result<T, Error> {
+        let keys = self.peer_keys(sender_id)?;
+        if !IdentityKeyPair::verify_data(&keys.identity_pk, secure_pkg) {
+            return Err(Error::InvalidSignature);
+        }
+        let plain = self
+            .transport_kp
+            .decrypt_from(&keys.transport_pk, &secure_pkg.ciphertext, &secure_pkg.nonce)
+            .map_err(|_| Error::InvalidMessage)?;
+        bincode::deserialize(&plain).map_err(|_| Error::InvalidMessage)
+    }
+
+    /// Signs a public payload meant for every other tracer (step 6 broadcast).
+    pub fn sign_for_peers<T: Serialize>(&self, payload: &T) -> BroadcastPackage {
+        let text = bincode::serialize(payload).expect("Failed to serialize package");
+        let mut nonce = vec![0u8; 12];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
+        let timestamp = current_timestamp();
+        let signature = self.identity_kp.sign_data(&text, &nonce, timestamp);
+        BroadcastPackage {
+            text,
+            nonce,
+            timestamp,
+            signature,
+        }
+    }
+
+    /// Authenticates a public payload signed by tracer `sender_id`.
+    pub fn open_peer_broadcast<T: for<'de> Deserialize<'de>>(
+        &self,
+        sender_id: usize,
+        pkg: &BroadcastPackage,
+    ) -> Result<T, Error> {
+        let keys = self.peer_keys(sender_id)?;
+        if !IdentityKeyPair::verify_broadcast_data(&keys.identity_pk, pkg) {
+            return Err(Error::InvalidSignature);
+        }
+        bincode::deserialize(&pkg.text).map_err(|_| Error::InvalidMessage)
+    }
+
     // === Distributed key generation (Figure `dist-keygen`) =================
 
-    /// Steps 1-6: samples this tracer's polynomial and proof of knowledge.
-    /// Returns the broadcast to be sent to the Combiner for relay.
-    pub fn start_dkg(&mut self) -> DkgBroadcast {
+    /// Steps 1-6: samples this tracer's polynomial and proof of knowledge,
+    /// records its own broadcast and returns the signed broadcast
+    /// `(pk_k, A_k, R_k, mu_k)` to send to every other tracer.
+    pub fn start_dkg(&mut self) -> BroadcastPackage {
         let te = self.te.expect("t_e not set");
         let n3 = self.n3.expect("n_3 not set");
         let participant =
             DkgParticipant::new(self.dkg_index(), te, n3).expect("Invalid DKG parameters");
         let broadcast = participant.broadcast.clone();
         self.dkg_participant = Some(participant);
-        broadcast
+        let own_id = self.index.expect("Tracer not bootstrapped");
+        self.load_dkg_round1(vec![(own_id, broadcast.clone())]);
+        self.sign_for_peers(&DkgRound1Payload { broadcast })
+    }
+
+    /// Step 7: authenticates every peer's signed round-1 broadcast and
+    /// records the ones whose proof of knowledge verifies.
+    pub fn load_dkg_round1_from_peers(&mut self, packages: Vec<(usize, BroadcastPackage)>) {
+        let mut broadcasts = Vec::with_capacity(packages.len());
+        for (id, pkg) in packages {
+            match self.open_peer_broadcast::<DkgRound1Payload>(id, &pkg) {
+                Ok(payload) => broadcasts.push((id, payload.broadcast)),
+                Err(_) => eprintln!(
+                    "[Tracer] Round-1 broadcast from tracer #{} failed authentication",
+                    id
+                ),
+            }
+        }
+        self.load_dkg_round1(broadcasts);
     }
 
     /// Step 7: verifies and records every tracer's round-1 broadcast.
-    /// Broadcasts that fail their proof of knowledge are simply dropped -
-    /// their dealer will not end up in `QUAL`.
+    /// Broadcasts that fail their proof of knowledge, or that claim a DKG
+    /// index other than their sender's, are dropped - their dealer will not
+    /// end up in `QUAL`.
     pub fn load_dkg_round1(&mut self, broadcasts: Vec<(usize, DkgBroadcast)>) {
         let te = self.te.expect("t_e not set");
         for (id, broadcast) in broadcasts {
+            if broadcast.index != id + 1 {
+                eprintln!(
+                    "[Tracer] Dropping tracer #{}: broadcast claims DKG index {}",
+                    id, broadcast.index
+                );
+                continue;
+            }
             if dkg::verify_broadcast(&broadcast, te).is_ok() {
                 self.dkg_broadcasts.insert(id + 1, broadcast);
             } else {
@@ -188,79 +313,44 @@ impl Tracer {
         }
     }
 
-    /// Step 8: computes the shares this tracer owes every other tracer,
-    /// encrypted and signed tracer-to-tracer, so the Combiner can relay them
-    /// without reading their contents.
-    pub fn compute_shares_for_peers(&self) -> Vec<(usize, SecurePackage)> {
-        let participant = self
-            .dkg_participant
-            .as_ref()
-            .expect("DKG not started for this tracer");
-        let n3 = self.n3.expect("n_3 not set");
-        let peers = self.peer_tracers.as_ref().expect("peer tracers not set");
-
-        (0..n3)
-            .map(|recipient_id| {
-                let share = participant.share_for(recipient_id + 1);
-                let payload = DkgSharePayload { share };
-                let plain = bincode::serialize(&payload).expect("serialize share");
-                let recipient_keys = peers[recipient_id];
-                let (ciphertext, nonce) = self
-                    .transport_kp
-                    .encrypt_to(&recipient_keys.transport_pk, &plain);
-                let timestamp = current_timestamp();
-                let signature = self.identity_kp.sign_data(&ciphertext, &nonce, timestamp);
-                (
-                    recipient_id,
-                    SecurePackage {
-                        ciphertext,
-                        nonce,
-                        timestamp,
-                        signature,
-                    },
-                )
-            })
-            .collect()
+    /// Step 8: the share `s_{kw} = f_k(w)` this tracer owes tracer
+    /// `recipient_id`, encrypted and signed for that tracer only.
+    pub fn dkg_share_for_peer(&self, recipient_id: usize) -> Result<SecurePackage, Error> {
+        let participant = self.dkg_participant.as_ref().ok_or(Error::InvalidMessage)?;
+        let share = participant.share_for(recipient_id + 1);
+        self.seal_for_peer(recipient_id, &DkgSharePayload { share })
     }
 
-    /// Steps 7 and 9: decrypts, authenticates and verifies every share this
-    /// tracer received, discarding any dealer whose share does not match its
-    /// round-1 commitments.
-    pub fn load_dkg_inbox(&mut self, items: Vec<(usize, SecurePackage)>) {
-        let peers = self
-            .peer_tracers
+    /// Step 8 for `w = k`: this tracer's share of its own polynomial never
+    /// leaves the process.
+    pub fn load_own_dkg_share(&mut self) {
+        let my_index = self.dkg_index();
+        let share = self
+            .dkg_participant
             .as_ref()
-            .expect("peer tracers not set")
-            .clone();
+            .expect("DKG not started for this tracer")
+            .share_for(my_index);
+        if let Some(own_broadcast) = self.dkg_broadcasts.get(&my_index) {
+            if dkg::verify_share(own_broadcast, &share, my_index).is_ok() {
+                self.dkg_shares_received.insert(my_index, share);
+            }
+        }
+    }
+
+    /// Step 9: decrypts, authenticates and verifies every share this tracer
+    /// received from its peers, discarding any dealer whose share does not
+    /// match its round-1 commitments.
+    pub fn load_dkg_inbox(&mut self, items: Vec<(usize, SecurePackage)>) {
         let my_index = self.dkg_index();
 
         for (from_id, secure_pkg) in items {
-            let Some(sender_keys) = peers.get(from_id) else {
-                eprintln!("[Tracer] Share from unknown tracer id {}", from_id);
-                continue;
-            };
-
-            if !IdentityKeyPair::verify_data(&sender_keys.identity_pk, &secure_pkg) {
-                eprintln!("[Tracer] Share from tracer #{} failed authentication", from_id);
-                continue;
-            }
-
-            let plaintext = match self.transport_kp.decrypt_from(
-                &sender_keys.transport_pk,
-                &secure_pkg.ciphertext,
-                &secure_pkg.nonce,
-            ) {
+            let payload: DkgSharePayload = match self.open_from_peer(from_id, &secure_pkg) {
                 Ok(p) => p,
                 Err(_) => {
-                    eprintln!("[Tracer] Share from tracer #{} failed to decrypt", from_id);
-                    continue;
-                }
-            };
-
-            let payload: DkgSharePayload = match bincode::deserialize(&plaintext) {
-                Ok(p) => p,
-                Err(_) => {
-                    eprintln!("[Tracer] Malformed share from tracer #{}", from_id);
+                    eprintln!(
+                        "[Tracer] Share from tracer #{} failed authentication or decryption",
+                        from_id
+                    );
                     continue;
                 }
             };
@@ -310,8 +400,8 @@ impl Tracer {
         Ok(())
     }
 
-    /// This tracer's own `pk_k`, to be reported to the Combiner so it can
-    /// compute `pk_e = prod_{k in QUAL} pk_k`.
+    /// This tracer's own `pk_k`. It is the only DKG output the Combiner ever
+    /// receives: it computes `pk_e = prod_k pk_k` from these alone.
     pub fn own_public_key(&self) -> Gt {
         self.tracer_key_share
             .as_ref()
@@ -400,6 +490,41 @@ impl Tracer {
 
         let input = DecryptionInput::from_public_keys(&sigma.ct.c0, &sigma.ct.c1, v0, v1);
         dkg::partial_decrypt(share, &input)
+    }
+
+    /// Step 7: `partial` sealed for tracer `recipient_id` only.
+    pub fn partial_for_peer(
+        &self,
+        recipient_id: usize,
+        partial: &PartialDecryption,
+    ) -> Result<SecurePackage, Error> {
+        self.seal_for_peer(
+            recipient_id,
+            &PartialDecryptionPayload {
+                partial: partial.clone(),
+            },
+        )
+    }
+
+    /// Step 8: opens the partial decryptions received from peers. A package
+    /// that fails authentication, or whose tracer index does not match its
+    /// sender, is dropped.
+    pub fn open_peer_partials(&self, items: Vec<(usize, SecurePackage)>) -> Vec<PartialDecryption> {
+        let mut partials = Vec::with_capacity(items.len());
+        for (from_id, pkg) in items {
+            match self.open_from_peer::<PartialDecryptionPayload>(from_id, &pkg) {
+                Ok(p) if p.partial.tracer_index == from_id + 1 => partials.push(p.partial),
+                Ok(_) => eprintln!(
+                    "[Tracer] Partial decryption from tracer #{} claims another tracer index",
+                    from_id
+                ),
+                Err(_) => eprintln!(
+                    "[Tracer] Partial decryption from tracer #{} failed authentication or decryption",
+                    from_id
+                ),
+            }
+        }
+        partials
     }
 
     /// Steps 9-13: verifies every collected partial decryption against the
